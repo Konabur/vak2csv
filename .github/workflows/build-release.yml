@@ -1,0 +1,85 @@
+name: Build VAK dataset and publish release
+
+# Запускается только вручную из вкладки Actions.
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_url:
+        description: "Ссылка на PDF Перечня ВАК"
+        required: true
+        default: "https://vak.gisnauka.ru/s3-files/01cc80c69fae4988a0246a8f5e2774e7:fisgna/public/media/uploaded/news_files/2094e02c-d851-48cd-9d57-fe7ebd34a039/ddcbef26-952c-4c84-a7f8-e8b48724a117.pdf"
+      specialties:
+        description: "Коды специальностей через пробел для отбора журналов (пусто — без фильтра). Напр.: 5.6.4 5.7.6"
+        required: false
+        default: ""
+      prefix_match:
+        description: "Трактовать коды как префиксы (5.6 -> 5.6.*)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write   # нужно для создания релиза
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install deps
+        run: uv sync
+
+      - name: Download VAK PDF
+        run: |
+          mkdir -p input output
+          echo "Скачиваю ${{ github.event.inputs.pdf_url }}"
+          curl -fSL --retry 3 -o input/perechen.pdf "${{ github.event.inputs.pdf_url }}"
+          ls -lh input/perechen.pdf
+
+      - name: Extract to CSV + SQLite
+        run: uv run python main.py --pdf input/perechen.pdf
+
+      - name: Compact representations
+        run: uv run python scripts/compact.py --csv output/vak.csv --out output/
+
+      - name: Filter by specialties (optional)
+        if: ${{ github.event.inputs.specialties != '' }}
+        run: |
+          PREFIX=""
+          if [ "${{ github.event.inputs.prefix_match }}" = "true" ]; then PREFIX="--prefix"; fi
+          uv run python scripts/match_journals.py ${{ github.event.inputs.specialties }} \
+            $PREFIX --csv output/vak.csv --out output/picked.csv
+
+      - name: Compute release metadata
+        id: meta
+        run: |
+          TAG="vak-$(date -u +%Y%m%d-%H%M%S)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "Сгенерировано воркфлоу build-release."
+            echo ""
+            echo "- Источник PDF: ${{ github.event.inputs.pdf_url }}"
+            echo "- Фильтр специальностей: ${{ github.event.inputs.specialties || '(нет)' }}"
+            echo "- Префиксное совпадение: ${{ github.event.inputs.prefix_match }}"
+            echo "- Дата сборки (UTC): $(date -u +'%Y-%m-%d %H:%M:%S')"
+          } > release_notes.md
+
+      - name: Create release (without the PDF)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Намеренно НЕ прикладываем input/perechen.pdf — только производные данные.
+          ASSETS=$(ls output/* 2>/dev/null)
+          echo "Файлы релиза:"; echo "$ASSETS"
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --notes-file release_notes.md \
+            $ASSETS
